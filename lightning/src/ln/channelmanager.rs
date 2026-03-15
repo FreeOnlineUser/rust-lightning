@@ -3357,6 +3357,31 @@ macro_rules! emit_initial_channel_ready_event {
 	};
 }
 
+/// Returns true if the error message clearly indicates a non-channel-type issue,
+/// such as funding amount limits or policy violations. When true, we should not
+/// attempt to retry the channel open with a downgraded channel type, as the same
+/// error will occur regardless of the channel type negotiated.
+fn is_non_channel_type_error(error_msg: &str) -> bool {
+	let lower = error_msg.to_ascii_lowercase();
+	// Funding amount rejections (e.g. ACINQ: "invalid funding_amount=100000 sat (min=400000 sat)")
+	if lower.contains("funding") && (lower.contains("min=") || lower.contains("max=") || lower.contains("too small") || lower.contains("too large")) {
+		return true;
+	}
+	// Explicit minimum channel size (e.g. "min chan size of 0.004 BTC")
+	if lower.contains("min chan size") || lower.contains("minimum channel size") {
+		return true;
+	}
+	// Dust limit rejections
+	if lower.contains("dust_limit") {
+		return true;
+	}
+	// Reserve rejections
+	if lower.contains("channel_reserve") && (lower.contains("too large") || lower.contains("too small")) {
+		return true;
+	}
+	false
+}
+
 fn convert_channel_err_internal<
 	Close: FnOnce(ClosureReason, &str) -> (ShutdownResult, Option<(msgs::ChannelUpdate, NodeId, NodeId)>),
 >(
@@ -16492,33 +16517,41 @@ impl<
 		} else {
 			{
 				// First check if we can advance the channel type and try again.
-				let per_peer_state = self.per_peer_state.read().unwrap();
-				let peer_state_mutex_opt = per_peer_state.get(&counterparty_node_id);
-				if peer_state_mutex_opt.is_none() { return; }
-				let mut peer_state_lock = peer_state_mutex_opt.unwrap().lock().unwrap();
-				let peer_state = &mut *peer_state_lock;
-				match peer_state.channel_by_id.get_mut(&msg.channel_id) {
-					Some(chan) => match chan.maybe_handle_error_without_close(
-						self.chain_hash, &self.fee_estimator, &self.logger,
-						&self.config.read().unwrap(), &peer_state.latest_features,
-					) {
-						Ok(Some(OpenChannelMessage::V1(msg))) => {
-							peer_state.pending_msg_events.push(MessageSendEvent::SendOpenChannel {
-								node_id: counterparty_node_id,
-								msg,
-							});
-							return;
+				// Only attempt channel type downgrade if the error plausibly relates to
+				// channel type negotiation. Errors about funding amount, policy, or other
+				// non-type issues should not trigger a retry with different channel features,
+				// as the same error will occur regardless of channel type.
+				let error_could_be_channel_type =
+					!is_non_channel_type_error(&msg.data);
+				if error_could_be_channel_type {
+					let per_peer_state = self.per_peer_state.read().unwrap();
+					let peer_state_mutex_opt = per_peer_state.get(&counterparty_node_id);
+					if peer_state_mutex_opt.is_none() { return; }
+					let mut peer_state_lock = peer_state_mutex_opt.unwrap().lock().unwrap();
+					let peer_state = &mut *peer_state_lock;
+					match peer_state.channel_by_id.get_mut(&msg.channel_id) {
+						Some(chan) => match chan.maybe_handle_error_without_close(
+							self.chain_hash, &self.fee_estimator, &self.logger,
+							&self.config.read().unwrap(), &peer_state.latest_features,
+						) {
+							Ok(Some(OpenChannelMessage::V1(msg))) => {
+								peer_state.pending_msg_events.push(MessageSendEvent::SendOpenChannel {
+									node_id: counterparty_node_id,
+									msg,
+								});
+								return;
+							},
+							Ok(Some(OpenChannelMessage::V2(msg))) => {
+								peer_state.pending_msg_events.push(MessageSendEvent::SendOpenChannelV2 {
+									node_id: counterparty_node_id,
+									msg,
+								});
+								return;
+							},
+							Ok(None) | Err(()) => {},
 						},
-						Ok(Some(OpenChannelMessage::V2(msg))) => {
-							peer_state.pending_msg_events.push(MessageSendEvent::SendOpenChannelV2 {
-								node_id: counterparty_node_id,
-								msg,
-							});
-							return;
-						},
-						Ok(None) | Err(()) => {},
-					},
-					None => {},
+						None => {},
+					}
 				}
 			}
 
