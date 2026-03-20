@@ -2315,9 +2315,35 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 	/// Stores new counterparty commitment(s) from the update and signs any
 	/// previously-stored commitments whose revocation secrets are now available.
 	///
+	/// Must be called for every [`ChannelMonitorUpdate`] to keep the commitment
+	/// rotation in sync. Skipping an update may cause a revoked commitment to be
+	/// missed.
+	///
 	/// Intended to be called during [`Persist::update_persisted_channel`].
 	///
+	/// # Crash Safety
+	///
+	/// The previous commitment data is cloned rather than consumed, so calling
+	/// this multiple times for the same update produces the same justice
+	/// transactions. The data also survives serialization, enabling recovery
+	/// after a restart.
+	///
+	/// The recommended pattern in [`Persist::update_persisted_channel`]:
+	/// 1. Call this method to obtain justice transactions
+	/// 2. Send them to the watchtower
+	/// 3. Persist the monitor update to disk
+	///
+	/// If the process crashes before step 3, the monitor update was never
+	/// durably stored, so it replays on restart and this method regenerates
+	/// the same transactions.
+	///
+	/// If the process crashes after step 3, the update won't replay, but the
+	/// previous commitment data is still present in the deserialized monitor.
+	/// Call [`get_pending_justice_txs`] on each loaded monitor at startup to
+	/// recover any transactions that were not delivered to the watchtower.
+	///
 	/// [`Persist::update_persisted_channel`]: crate::chain::chainmonitor::Persist::update_persisted_channel
+	/// [`get_pending_justice_txs`]: Self::get_pending_justice_txs
 	pub fn sign_justice_txs_from_update(
 		&self, update: &ChannelMonitorUpdate, feerate_per_kw: u64, destination_script: ScriptBuf,
 	) -> Vec<JusticeTransaction> {
@@ -2326,6 +2352,33 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 			feerate_per_kw,
 			destination_script,
 		)
+	}
+
+	/// Returns signed justice transactions for all revoked counterparty commitments
+	/// currently stored in this monitor, without mutating state.
+	///
+	/// Intended for crash recovery: on restart, the [`Persist`] implementation calls
+	/// this on each loaded monitor to recover any justice transactions that were not
+	/// successfully delivered to a watchtower before the previous shutdown or crash.
+	///
+	/// Note that this only recovers justice transactions for the most recently
+	/// revoked commitment per funding scope. If multiple commitment rotations
+	/// occurred between the crash and restart (e.g., the counterparty sent
+	/// several updates while the process was down), earlier revoked commitments
+	/// will have been overwritten. In practice, this requires the counterparty
+	/// to advance state while this node is offline, which is uncommon.
+	///
+	/// The watchtower should deduplicate based on the revoked commitment txid, or
+	/// the [`Persist`] implementation should track which justice transactions have
+	/// been acknowledged.
+	///
+	/// This is idempotent and safe to call multiple times.
+	///
+	/// [`Persist`]: crate::chain::chainmonitor::Persist
+	pub fn get_pending_justice_txs(
+		&self, feerate_per_kw: u64, destination_script: ScriptBuf,
+	) -> Vec<JusticeTransaction> {
+		self.inner.lock().unwrap().get_pending_justice_txs(feerate_per_kw, destination_script)
 	}
 
 	pub(crate) fn get_min_seen_secret(&self) -> u64 {
@@ -4626,6 +4679,11 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 	fn sign_initial_justice_txs(
 		&mut self, feerate_per_kw: u64, destination_script: ScriptBuf,
 	) -> Vec<JusticeTransaction> {
+		// Only set the initial commitment if we haven't already received updates.
+		// Calling this after updates would reset the rotation state.
+		if self.funding.cur_counterparty_commitment_tx.is_some() {
+			return Vec::new();
+		}
 		let commitment_tx = match self.initial_counterparty_commitment_tx() {
 			Some(tx) => tx,
 			None => return Vec::new(),
@@ -4655,16 +4713,24 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			}
 		}
 
-		// Collect prev commitments that have revocation secrets available, clearing them
-		// from storage so they aren't signed again on subsequent calls.
+		// Determine which secrets were provided in this update, so we only sign
+		// prev commitments that were newly revoked (not already signed on a prior call).
+		let new_secret_indices: Vec<u64> = update.updates.iter().filter_map(|step| {
+			match step {
+				ChannelMonitorUpdateStep::CommitmentSecret { idx, .. } => Some(*idx),
+				_ => None,
+			}
+		}).collect();
+
+		// Collect prev commitments whose revocation secret was just provided in this update.
+		// We clone rather than take so the data survives in the serialized monitor
+		// for crash recovery via get_pending_justice_txs().
 		let mut to_sign = Vec::new();
 		for funding in core::iter::once(&mut self.funding).chain(self.pending_funding.iter_mut()) {
-			let should_take =
-				funding.prev_counterparty_commitment_tx.as_ref().is_some_and(|prev| {
-					self.commitment_secrets.get_secret(prev.commitment_number()).is_some()
-				});
-			if should_take {
-				to_sign.push(funding.prev_counterparty_commitment_tx.take().unwrap());
+			if let Some(ref prev) = funding.prev_counterparty_commitment_tx {
+				if new_secret_indices.contains(&prev.commitment_number()) {
+					to_sign.push(prev.clone());
+				}
 			}
 		}
 
@@ -4673,6 +4739,30 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			result.extend(
 				self.try_sign_justice_txs(commitment_tx, feerate_per_kw, destination_script.clone())
 			);
+		}
+		result
+	}
+
+	/// Returns signed justice transactions for all revoked counterparty commitments
+	/// currently stored in this monitor, without mutating state.
+	///
+	/// Intended for crash recovery: on restart, the `Persist` implementation calls
+	/// this on each loaded monitor to recover any justice transactions that were not
+	/// successfully delivered to a watchtower before the previous shutdown or crash.
+	///
+	/// This is idempotent and safe to call multiple times.
+	fn get_pending_justice_txs(
+		&self, feerate_per_kw: u64, destination_script: ScriptBuf,
+	) -> Vec<JusticeTransaction> {
+		let mut result = Vec::new();
+		for funding in core::iter::once(&self.funding).chain(self.pending_funding.iter()) {
+			if let Some(ref prev) = funding.prev_counterparty_commitment_tx {
+				if self.commitment_secrets.get_secret(prev.commitment_number()).is_some() {
+					result.extend(
+						self.try_sign_justice_txs(prev, feerate_per_kw, destination_script.clone())
+					);
+				}
+			}
 		}
 		result
 	}

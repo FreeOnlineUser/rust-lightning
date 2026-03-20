@@ -1158,6 +1158,69 @@ pub fn test_justice_tx_htlc_from_monitor_updates() {
 }
 
 #[xtest(feature = "_externalize_tests")]
+pub fn test_get_pending_justice_txs_crash_recovery() {
+	// Verify that get_pending_justice_txs returns the same justice transactions
+	// as sign_justice_txs_from_update, enabling crash recovery without replay.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let destination_script = chanmon_cfgs[1].keys_manager.get_destination_script([0; 32]).unwrap();
+	let persisters = [
+		WatchtowerPersister::new(chanmon_cfgs[0].keys_manager.get_destination_script([0; 32]).unwrap()),
+		WatchtowerPersister::new(destination_script.clone()),
+	];
+	let node_cfgs = create_node_cfgs_with_persisters(2, &chanmon_cfgs, persisters.iter().collect());
+	let legacy_cfg = test_legacy_channel_config();
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(legacy_cfg.clone()), Some(legacy_cfg)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let (_, _, channel_id, _) = create_announced_chan_between_nodes(&nodes, 0, 1);
+
+	// Send a payment to create a revoked commitment
+	send_payment(&nodes[0], &[&nodes[1]], 1_000_000);
+
+	// The watchtower persister got justice txs via sign_justice_txs_from_update.
+	// Now simulate crash recovery: call get_pending_justice_txs on the monitor
+	// and verify it returns matching transactions.
+	{
+		let monitor = get_monitor!(nodes[1], channel_id);
+		let pending = monitor.get_pending_justice_txs(
+			crate::chain::chaininterface::FEERATE_FLOOR_SATS_PER_KW as u64,
+			destination_script.clone(),
+		);
+
+		// After one payment, there should be one revoked commitment (the initial one)
+		// and get_pending_justice_txs should recover the justice tx for it
+		assert!(!pending.is_empty(), "get_pending_justice_txs should return justice txs after revocation");
+
+		let watchtower_txs = persisters[1].justice_txs(channel_id, &pending[0].revoked_commitment_txid);
+		assert_eq!(pending.len(), watchtower_txs.len(), "Pending justice txs should match watchtower state");
+
+		// Verify the recovered transactions are functionally equivalent
+		// (ECDSA signatures are non-deterministic, so byte-identity isn't expected)
+		for (p, w) in pending.iter().zip(watchtower_txs.iter()) {
+			assert_eq!(p.tx.input[0].previous_output, w.input[0].previous_output,
+				"Crash recovery justice tx should spend the same output");
+			assert_eq!(p.tx.output[0].script_pubkey, w.output[0].script_pubkey,
+				"Crash recovery justice tx should pay to the same destination");
+			assert_eq!(p.tx.output[0].value, w.output[0].value,
+				"Crash recovery justice tx should have the same value");
+			assert_eq!(p.tx.version, w.version,
+				"Crash recovery justice tx should have the same version");
+			assert_eq!(p.tx.lock_time, w.lock_time,
+				"Crash recovery justice tx should have the same locktime");
+		}
+
+		// Call it again to verify idempotency
+		let pending2 = monitor.get_pending_justice_txs(
+			crate::chain::chaininterface::FEERATE_FLOOR_SATS_PER_KW as u64,
+			destination_script.clone(),
+		);
+		assert_eq!(pending.len(), pending2.len(), "get_pending_justice_txs should be idempotent");
+	}
+	// LockedChannelMonitor dropped here
+}
+
+#[xtest(feature = "_externalize_tests")]
 pub fn claim_htlc_outputs() {
 	// Node revoked old state, htlcs haven't time out yet, claim them in shared justice tx
 	let mut chanmon_cfgs = create_chanmon_cfgs(2);
